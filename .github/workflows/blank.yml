@@ -1,0 +1,89 @@
+name: EC2 Forensics Capture
+
+on:
+  workflow_dispatch:
+    inputs:
+      aws_account_id:
+        description: "Target AWS Account ID"
+        required: true
+      role_name:
+        description: "Role with permissions to perform forensics"
+        required: true
+      instance_id:
+        description: "EC2 Instance ID to capture"
+        required: true
+
+jobs:
+  collect-forensics:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (Assume Role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ github.event.inputs.aws_account_id }}:role/${{ github.event.inputs.role_name }}
+          aws-region: us-east-1
+
+      - name: Create output directory
+        run: mkdir forensic-output
+
+      - name: Capture EC2 instance description
+        run: |
+          aws ec2 describe-instances \
+            --instance-ids "${{ github.event.inputs.instance_id }}" \
+            --output json > forensic-output/instance-description.json
+
+      - name: Capture summarized metadata
+        run: |
+          aws ec2 describe-instances \
+            --instance-ids "${{ github.event.inputs.instance_id }}" \
+            --query 'Reservations[].Instances[].{Id:InstanceId,State:State.Name,PrivateIP:PrivateIpAddress,PublicIP:PublicIpAddress,AZ:Placement.AvailabilityZone,Type:InstanceType,Image:ImageId,LaunchTime:LaunchTime,Tags:Tags,SecurityGroups:SecurityGroups,IamProfile:IamInstanceProfile}' \
+            --output json > forensic-output/summary.json
+
+      - name: Capture ENI information
+        run: |
+          aws ec2 describe-network-interfaces \
+            --filters Name=attachment.instance-id,Values=${{ github.event.inputs.instance_id }} \
+            --output json > forensic-output/enis.json
+
+      - name: Capture attached volumes
+        run: |
+          aws ec2 describe-volumes \
+            --filters Name=attachment.instance-id,Values=${{ github.event.inputs.instance_id }} \
+            --output json > forensic-output/volumes.json
+
+      - name: Capture console output
+        run: |
+          aws ec2 get-console-output \
+            --instance-id "${{ github.event.inputs.instance_id }}" \
+            --output text > forensic-output/console-output.txt || true
+
+      - name: Capture CloudTrail events for the instance
+        run: |
+          START_TIME=$(date -u -d '2 days ago' +%Y-%m-%dT%H:%M:%SZ)
+          aws cloudtrail lookup-events \
+            --lookup-attributes AttributeKey=ResourceName,AttributeValue=${{ github.event.inputs.instance_id }} \
+            --start-time "$START_TIME" \
+            --output json > forensic-output/cloudtrail.json
+
+      - name: Capture Security Groups
+        run: |
+          SG_IDS=$(jq -r '.[0].SecurityGroups[].GroupId' forensic-output/summary.json)
+          aws ec2 describe-security-groups --group-ids $SG_IDS \
+            --output json > forensic-output/security-groups.json
+
+      - name: Capture IAM role details
+        run: |
+          ROLE_NAME=$(jq -r '.[0].IamProfile.Arn' forensic-output/summary.json | awk -F'/' '{print $NF}')
+          if [ -n "$ROLE_NAME" ]; then
+            aws iam get-role --role-name "$ROLE_NAME" --output json > forensic-output/iam-role.json
+          fi
+
+      - name: Upload forensics artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ec2-forensics
+          path: forensic-output
